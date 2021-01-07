@@ -4,6 +4,7 @@ import ssl
 import socket
 import urllib.parse
 import csv
+import time
 
 import requests
 import click
@@ -54,8 +55,48 @@ def get_security_txt(hostname, port=None, timeout=5):
                       timeout=timeout)
     return r.status_code
 
+
+def get_grade(minus_points, plus_points):
+    grade = min(5, minus_points)
+    return chr(ord("A") + grade) + "+" * plus_points
+
+
+def get_ssllabs_grade(hostname, force_check=False):
+    ssllabs_api = "https://api.ssllabs.com/api/v3/"
+    reqn = 0
+    try:
+        while True:
+            reqn += 1
+            r = requests.get(ssllabs_api + "analyze", params={
+                                "host": hostname,
+                                "maxAge": 99999,
+                             }).json()
+            status = r.get("status")
+            eps = r.get("endpoints", [])
+            print(f"SSL Labs status {status}")
+            if status == "DNS":
+                print("Sleeping 10 seconds to allow DNS resolution")
+                time.sleep(10)
+            elif status == "IN_PROGRESS" and force_check and reqn < 8:
+                for ep in eps:
+                    print(f"endpoint {ep.get('ipAddress')} progress {ep.get('progress')}")
+                print("Sleeping 60 seconds to allow SSL Labs analysis")
+                time.sleep(60)
+            elif status == "ERROR":
+                return
+            else:
+                if not status == "READY":
+                    print("Giving up SSL Labs")
+                grades = [e["grade"] for e in eps if e.get("grade")]
+                return max(grades) if grades else None
+    except requests.exceptions.RequestException:
+        return
+
+
 def check_https(hostname):
     https_url = f"https://{hostname}/"
+    minus_points = 0
+    plus_points = 0
     try:
         st, loc = get_http_status(hostname)
         print(f"HTTP status: {st}")
@@ -63,6 +104,7 @@ def check_https(hostname):
             print(f"Redirecting to: {loc}")
         if st < 300:
             http_status = "Insecure content"
+            minus_points += 2
         elif 300 <= st < 400:
             if loc.lower().startswith(f"https://{hostname}/"):
                 http_status = f"Redirects to self ({st})"
@@ -71,10 +113,13 @@ def check_https(hostname):
                 https_url = loc
             else:
                 http_status = f"Redirects to insecure ({st}, {loc})"
+                minus_points += 2
         else:
             http_status = f"Broken ({st})"
+            minus_points += 1
     except requests.RequestException as e:
         http_status = f"Non-functional ({e})"
+        minus_points += 1
     print(f"Overall HTTP status: {http_status}")
 
     sth = None
@@ -82,6 +127,7 @@ def check_https(hostname):
     issuer = None
     notAfter = None
     securitytxt = None
+    do_ssl_labs = False
     try:
         print("Trying TLS connection…")
         parsed = urllib.parse.urlparse(https_url)
@@ -89,13 +135,35 @@ def check_https(hostname):
         print(f"TLS connection OK: issuer: {issuer}, notAfter: {notAfter}")
         sth, hsts = get_hsts_header(https_url)
         print(f"HTTPS Status {sth}, HSTS: {hsts}")
+        if hsts is not None and "max-age=" in hsts:
+            plus_points += 1
         https_status = f"OK ({sth})"
         securitytxt = get_security_txt(parsed.hostname, parsed.port)
-    except (ssl.SSLError, socket.error, ConnectionRefusedError, ssl.CertificateError) as e:
+        if securitytxt == 200:
+            plus_points += 1
+        if "TERENA SSL High Assurance CA" in issuer:
+            plus_points += 1
+        if not issuer.startswith("TERENA"):
+            minus_points +=1
+
+    except (socket.error, ConnectionRefusedError) as e:
         print(f"Broken TLS connection: {e}")
         https_status = f"Broken ({e})"
+        minus_points += 3
+        if http_status.startswith("Non-functional"):
+            return
+    except (ssl.SSLError, ssl.CertificateError) as e:
+        print(f"Broken TLS connection: {e}")
+        https_status = f"Broken ({e})"
+        minus_points += 3
+        do_ssl_labs = True
 
-    return (http_status, https_status, hsts, securitytxt, issuer, notAfter,)
+    grade = get_grade(minus_points, plus_points)
+    ssllabs_url = "https://www.ssllabs.com/ssltest/analyze.html?d=" + hostname
+    ssllabs_grade = get_ssllabs_grade(hostname, do_ssl_labs)
+
+
+    return (grade, http_status, https_status, hsts, securitytxt, issuer, ssllabs_grade, ssllabs_url)
 
 
 @click.command()
@@ -108,7 +176,7 @@ def main(domainlist, report):
     """
     if report:
         writer = csv.writer(report)
-        writer.writerow(("Domain", "HTTP Status", "HTTPS Status", "HSTS Header", "GET /.well-known/security.txt", "issuer", "notAfter",))
+        writer.writerow(("Domain", "Grade", "HTTP Status", "HTTPS Status", "HSTS Header", "GET /.well-known/security.txt", "issuer", "SSL Labs grade", "SSL Labs URL",))
 
     for line in domainlist:
         d = line.strip().rstrip(".")
